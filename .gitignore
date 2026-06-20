@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+\[PUB\] India_runs_data_and_ai_challenge/
+*.pyc
+.DS_Store
+sample_submission.csv
