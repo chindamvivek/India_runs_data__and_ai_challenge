@@ -46,7 +46,22 @@ ML_TITLES = re.compile(
 SWE_TITLES = re.compile(
     r"\b(software engineer|backend engineer|sde|senior engineer|"
     r"staff engineer|principal engineer|platform engineer|"
-    r"data engineer|data scientist|research scientist)\b",
+    r"data engineer|data scientist|research scientist|"
+    # Frontend / mobile / full-stack engineers are still engineers
+    r"frontend engineer|front-end engineer|front end engineer|"
+    r"full stack|full-stack developer|fullstack developer|"
+    r"mobile developer|mobile engineer|ios developer|android developer|"
+    # Infrastructure / DevOps are legitimate tech backgrounds
+    r"devops engineer|site reliability|sre|cloud engineer|"
+    r"infrastructure engineer|platform engineer|"
+    # Language-specific titles that are clearly software engineers
+    r"java developer|python developer|\.net developer|net developer|"
+    r"golang developer|ruby developer|c\+\+ developer|"
+    # Embedded / firmware are engineering
+    r"firmware engineer|embedded engineer|"
+    # QA is adjacent technical — can write code, understands systems
+    r"qa engineer|quality assurance engineer|sdet|test engineer"
+    r")\b",
     re.IGNORECASE,
 )
 
