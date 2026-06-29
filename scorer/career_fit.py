@@ -6,68 +6,99 @@ Scores a candidate on how well their career trajectory matches the JD for
 
 Weight in composite: 35%
 
-Key design decisions (per implementation plan v4):
-- Evaluated against full career_history, NOT just current_title
-- Plain-language fits counted (e.g., "built recommendation engine" at a product co)
-- Pure consulting-only careers penalised (0.5× multiplier)
-- career_fit_score CAPPED at 1.0 BEFORE job-hopping penalty
-- Job-hopping penalty applied after cap, then floored at 0.0
-- Returns a scored_data dict (not just a float) so reasoning/generator.py
-  can use the same intermediate values without recomputing them
+Design (v5 — Tiered Role Classification):
 
-Returns dict with keys:
+Three improvements over v4:
+
+  1. Product company detection (Bug fix)
+     The v4 implementation used plain substring matching against PRODUCT_INDUSTRIES,
+     which incorrectly classified "Paper Products" as a tech company because
+     "product" is a substring of "paper products".
+     Replaced with a word-boundary regex (TECH_PRODUCT_INDUSTRIES) against a
+     curated list of tech/startup industry terms. The generic word "product"
+     has been removed.
+
+  2. Description-based specialisation override (New)
+     Generic titles like "Software Engineer" are cross-checked against the job
+     description. If the description clearly signals QA, frontend, or mobile
+     engineering work, the role is reclassified to Tier D regardless of title.
+     QA_DESC_SIGNALS, FRONTEND_DESC_SIGNALS, and MOBILE_DESC_SIGNALS detect
+     these specialisations.
+
+  3. Four-tier SWE classification (Improved granularity)
+     Tier A — Direct ML/AI/Search/NLP titles         base 0.85 – 0.90
+     Tier B — Backend/Platform/Data engineers         base 0.20 – 0.65
+     Tier C — Generic SWE/Full-stack/Cloud/DevOps     base 0.15 – 0.50
+     Tier D — Frontend/Mobile/QA engineers            base 0.05 – 0.20
+     (v4 merged Tier B/C/D into one SWE bucket)
+
+  4. Per-role explainability (New)
+     Returns a ``role_breakdown`` list (one dict per career entry) so that
+     diagnostics can show exactly which signals fired and why.
+
+Returns dict with keys (unchanged from v4, plus role_breakdown):
     score           float [0.0, 1.0]
     ml_months       int   — total months in ML/AI/Search roles
     avg_tenure      float — avg months per completed role (0 if < 3 roles)
     consulting_only bool  — True if >80% career at consulting firms
-    has_retrieval   bool  — True if retrieval/ranking keywords in any job description
+    has_retrieval   bool  — True if retrieval/ranking keywords in any job desc
     top_role        str   — best matching role title found in career history
+    role_breakdown  list  — per-role debug dicts (new in v5)
 """
 
 from __future__ import annotations
 import re
 
 # ---------------------------------------------------------------------------
-# Constants
+# Tier A — Direct ML / AI / Search specialists
 # ---------------------------------------------------------------------------
-
-# Titles that directly match what the JD is looking for
-ML_TITLES = re.compile(
+TIER_A_TITLES = re.compile(
     r"\b("
     r"ml engineer|machine learning engineer|ai engineer|applied scientist|"
     r"applied ml|nlp engineer|search engineer|ranking engineer|"
     r"recommendation engineer|retrieval engineer|research engineer|"
-    r"ai\/ml engineer|ml scientist|applied researcher"
+    r"ai\/ml engineer|ml scientist|applied researcher|"
+    r"computer vision engineer|speech engineer|conversational ai"
     r")\b",
     re.IGNORECASE,
 )
 
-# Strong secondary: general SWE/backend/data at product companies with ML context
-SWE_TITLES = re.compile(
-    r"\b(software engineer|backend engineer|sde|senior engineer|"
-    r"staff engineer|principal engineer|platform engineer|"
-    r"data engineer|data scientist|research scientist|"
-    # Frontend / mobile / full-stack engineers are still engineers
-    r"frontend engineer|front-end engineer|front end engineer|"
-    r"full stack|full-stack developer|fullstack developer|"
-    r"mobile developer|mobile engineer|ios developer|android developer|"
-    # Infrastructure / DevOps are legitimate tech backgrounds
-    r"devops engineer|site reliability|sre|cloud engineer|"
-    r"infrastructure engineer|platform engineer|"
-    # Language-specific titles that are clearly software engineers
+# Tier B — Backend / Platform / Data roles (strong SWE depth, ML-adjacent)
+TIER_B_TITLES = re.compile(
+    r"\b("
+    r"backend engineer|back-end engineer|back end engineer|"
+    r"platform engineer|distributed systems engineer|"
+    r"infrastructure engineer|systems engineer|"
+    r"staff engineer|principal engineer|senior engineer|"  # seniority only, not enough alone
+    r"data engineer|data scientist|analytics engineer|"
+    r"research scientist|ml ops engineer|mlops engineer|"
+    r"site reliability engineer|sre|devops engineer|cloud engineer"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Tier C — Generic SWE / Full-stack / language-specific titles
+TIER_C_TITLES = re.compile(
+    r"\b("
+    r"software engineer|software developer|sde|sde-\d|"
+    r"full stack|full-stack|fullstack|"
     r"java developer|python developer|\.net developer|net developer|"
     r"golang developer|ruby developer|c\+\+ developer|"
-    # Embedded / firmware are engineering
-    r"firmware engineer|embedded engineer|"
-    # QA is adjacent technical — can write code, understands systems
-    r"qa engineer|quality assurance engineer|sdet|test engineer"
+    r"firmware engineer|embedded engineer"
     r")\b",
     re.IGNORECASE,
 )
 
-# Adjacent: data-adjacent roles that can score if descriptions contain ML work
-DATA_TITLES = re.compile(
-    r"\b(data engineer|analytics engineer|data analyst)\b",
+# Tier D — Frontend / Mobile / QA (lowest relevance to AI engineering)
+TIER_D_TITLES = re.compile(
+    r"\b("
+    r"frontend engineer|front-end engineer|front end engineer|"
+    r"ui engineer|ui developer|"
+    r"mobile developer|mobile engineer|"
+    r"ios developer|ios engineer|android developer|android engineer|"
+    r"qa engineer|quality assurance engineer|sdet|test engineer|"
+    r"test automation engineer|automation engineer"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -84,7 +115,46 @@ NON_TECH_TITLES = re.compile(
     re.IGNORECASE,
 )
 
-# Retrieval/ranking keywords in job descriptions (plain-language fit signal)
+# ---------------------------------------------------------------------------
+# Description-based specialisation signals
+# Used to reclassify ambiguous titles (e.g. "Software Engineer") to Tier D
+# when the description reveals QA, frontend, or mobile work.
+# ---------------------------------------------------------------------------
+QA_DESC_SIGNALS = re.compile(
+    r"\b("
+    r"selenium|cypress|pytest|unittest|jest|mocha|"
+    r"test automation|qa engineering|quality assurance|test suite|"
+    r"acceptance criteria|testability|locust|load test|load-test|"
+    r"end-to-end test|e2e test|regression test|manual test|"
+    r"functional test|test coverage|sdet"
+    r")\b",
+    re.IGNORECASE,
+)
+
+FRONTEND_DESC_SIGNALS = re.compile(
+    r"\b("
+    r"react|vue|angular|angularjs|html|css|webpack|"
+    r"design system|animation|accessibility|"
+    r"dom|sass|less|responsive design|single.page.app|"
+    r"nextjs|next\.js|gatsby|svelte|storybook|"
+    r"ui component|browser compatibility|tailwind"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MOBILE_DESC_SIGNALS = re.compile(
+    r"\b("
+    r"android|ios|swift|kotlin|flutter|react native|"
+    r"jetpack|xcode|objective-c|coroutines|hilt|"
+    r"app store|play store|push notification|offline.first|"
+    r"mobile app|mvvm|viewmodel"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Retrieval / ML keyword signals (job description context)
+# ---------------------------------------------------------------------------
 RETRIEVAL_KEYWORDS = re.compile(
     r"\b("
     r"retrieval|ranking|recommendation|search|vector|embedding|"
@@ -106,97 +176,223 @@ ML_KEYWORDS_IN_DESC = re.compile(
     re.IGNORECASE,
 )
 
-# Companies explicitly named in JD as consulting/services firms to discount
+# ---------------------------------------------------------------------------
+# Company classification
+# ---------------------------------------------------------------------------
+
+# Known consulting / services firms to discount
 CONSULTING_FIRMS = {
     "tcs", "tata consultancy", "infosys", "wipro", "accenture",
     "cognizant", "capgemini", "hcl", "hcl technologies",
     "tech mahindra", "mphasis", "hexaware", "ltimindtree",
-    "l&t infotech", "mindtree",  # mindtree merged with LTI but still seen
+    "l&t infotech", "mindtree",
 }
 
-# Industries that are clearly product/tech (not pure services)
-PRODUCT_INDUSTRIES = {
-    "software", "saas", "internet", "e-commerce", "ecommerce",
-    "ai", "artificial intelligence", "fintech", "edtech", "healthtech",
-    "technology", "tech", "product", "startup",
-}
+# Word-boundary regex against curated tech/startup industry terms.
+# Deliberately excludes the generic word "product" to avoid matching
+# "Paper Products", "Consumer Products", "Food Products", etc.
+TECH_PRODUCT_INDUSTRIES = re.compile(
+    r"\b("
+    r"software|saas|internet|e-commerce|ecommerce|"
+    r"fintech|edtech|healthtech|adtech|proptech|insurtech|legaltech|"
+    r"agritech|foodtech|logistech|"
+    r"artificial intelligence|machine learning|deep learning|"
+    r"technology|startup|"
+    r"social media|cloud computing|cloud services|gaming|"
+    r"cybersecurity|information security|"
+    r"media technology|streaming|semiconductor|"
+    r"search engine|e-learning"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _is_consulting_company(company: str, industry: str) -> bool:
     """Return True if the company is a known consulting/services firm."""
     c_lower = company.lower().strip()
-    # Exact match on known firms
     for firm in CONSULTING_FIRMS:
         if firm in c_lower:
             return True
-    # Industry-level signal: "IT Services" is the canonical consulting industry
     if "it services" in industry.lower():
         return True
     return False
 
 
 def _is_product_company(company: str, industry: str) -> bool:
-    """Return True if the company appears to be a product/tech company."""
+    """
+    Return True if the company is a technology product company.
+
+    Uses word-boundary matching against TECH_PRODUCT_INDUSTRIES.
+    Consulting firms are always False regardless of industry label.
+    """
     if _is_consulting_company(company, industry):
         return False
-    ind_lower = industry.lower()
-    for prod_ind in PRODUCT_INDUSTRIES:
-        if prod_ind in ind_lower:
-            return True
-    return False
+    return bool(TECH_PRODUCT_INDUSTRIES.search(industry))
 
 
-def _best_role_score(title: str, description: str, company: str, industry: str) -> float:
+def _detect_desc_specialisation(description: str) -> str | None:
     """
-    Score a single career role based on title + description + company type.
-    Returns a base score in [0.0, 0.90].
-    """
-    # Hard disqualifier: title is clearly non-technical
-    if NON_TECH_TITLES.search(title):
-        return 0.0
+    Infer the actual specialisation from job description text.
 
-    is_product = _is_product_company(company, industry)
+    Returns one of: "qa", "frontend", "mobile", or None (ambiguous).
+    Used to reclassify generic titles to Tier D when the description
+    reveals a non-AI-adjacent specialisation.
+    """
+    signals = {
+        "qa":       bool(QA_DESC_SIGNALS.search(description)),
+        "frontend": bool(FRONTEND_DESC_SIGNALS.search(description)),
+        "mobile":   bool(MOBILE_DESC_SIGNALS.search(description)),
+    }
+    # Return first detected specialisation (priority: qa > mobile > frontend)
+    for spec in ("qa", "mobile", "frontend"):
+        if signals[spec]:
+            return spec
+    return None
+
+
+def _score_role(
+    title: str,
+    description: str,
+    company: str,
+    industry: str,
+) -> tuple[float, dict]:
+    """
+    Score a single career role. Returns (base_score, debug_dict).
+
+    The debug_dict contains:
+        tier        str   — A / B / C / D / non-tech / fallback
+        title_match str   — which regex matched the title
+        desc_spec   str   — description specialisation override (or None)
+        is_product  bool
+        is_consulting bool
+        has_retrieval bool
+        has_ml_context bool
+        score       float
+        reason      str   — human-readable explanation
+    """
+    is_product    = _is_product_company(company, industry)
+    is_consulting = _is_consulting_company(company, industry)
     has_retrieval = bool(RETRIEVAL_KEYWORDS.search(description))
-    has_ml_context = bool(ML_KEYWORDS_IN_DESC.search(description))
+    has_ml_ctx    = bool(ML_KEYWORDS_IN_DESC.search(description))
+    desc_spec     = _detect_desc_specialisation(description)
 
-    # Tier 1: Direct ML/AI/Search title
-    if ML_TITLES.search(title):
-        return 0.90
+    debug = {
+        "is_product":    is_product,
+        "is_consulting": is_consulting,
+        "has_retrieval": has_retrieval,
+        "has_ml_context": has_ml_ctx,
+        "desc_spec":     desc_spec,   # "qa", "frontend", "mobile", or None
+    }
 
-    # Tier 2: SWE/Backend/Data Scientist at product company with ML context
-    if SWE_TITLES.search(title):
-        if is_product and (has_retrieval or has_ml_context):
-            return 0.70
-        elif is_product:
-            return 0.35  # Product company SWE but no ML evidence
-        elif has_retrieval or has_ml_context:
-            return 0.40  # Consulting SWE but shows ML work
-        else:
-            return 0.25  # Generic SWE
+    # ── Hard disqualifier ────────────────────────────────────────────────
+    if NON_TECH_TITLES.search(title):
+        m = NON_TECH_TITLES.search(title).group(0)
+        debug.update(tier="non-tech", title_match=m,
+                     score=0.0, reason=f"Non-technical title: '{m}'")
+        return 0.0, debug
 
-    # Tier 3: Data Engineer at product company with retrieval keywords
-    if DATA_TITLES.search(title):
+    # ── Tier A — Direct ML / AI / Search title ───────────────────────────
+    if TIER_A_TITLES.search(title):
+        m = TIER_A_TITLES.search(title).group(0)
+        score = 0.90 if has_retrieval else 0.85
+        reason = (
+            f"Tier A: ML/AI/Search title '{m}'"
+            + ("; +retrieval keywords in desc" if has_retrieval else "")
+        )
+        debug.update(tier="A", title_match=m, score=score, reason=reason)
+        return score, debug
+
+    # ── Tier B — Backend / Platform / Data ───────────────────────────────
+    if TIER_B_TITLES.search(title):
+        m = TIER_B_TITLES.search(title).group(0)
+
+        # Description override: title is "Data Scientist" but work is actually QA?
+        # (Rare, but defensive.)
+        if desc_spec in ("qa", "frontend", "mobile"):
+            score = 0.10 if is_product else 0.05
+            reason = (
+                f"Tier B title '{m}' overridden to Tier D by description "
+                f"({desc_spec} signals detected)"
+            )
+            debug.update(tier="B→D", title_match=m, score=score, reason=reason)
+            return score, debug
+
         if is_product and has_retrieval:
-            return 0.45
-        elif is_product and has_ml_context:
-            return 0.35
-        return 0.20
+            score, reason = 0.65, f"Tier B: '{m}' at product co with retrieval keywords"
+        elif is_product and has_ml_ctx:
+            score, reason = 0.55, f"Tier B: '{m}' at product co with ML context"
+        elif is_product:
+            score, reason = 0.30, f"Tier B: '{m}' at product co (no ML evidence)"
+        elif has_retrieval or has_ml_ctx:
+            score, reason = 0.35, f"Tier B: '{m}' at non-product co with ML/retrieval"
+        else:
+            score, reason = 0.20, f"Tier B: '{m}' generic (no product/ML evidence)"
 
-    # Fallback: any other technical-sounding title
+        debug.update(tier="B", title_match=m, score=score, reason=reason)
+        return score, debug
+
+    # ── Tier C — Generic SWE / Full-stack / Language-specific ────────────
+    if TIER_C_TITLES.search(title):
+        m = TIER_C_TITLES.search(title).group(0)
+
+        # Description override: "Software Engineer" doing QA/frontend/mobile work
+        if desc_spec in ("qa", "frontend", "mobile"):
+            score = 0.10 if is_product else 0.05
+            reason = (
+                f"Tier C title '{m}' overridden to Tier D by description "
+                f"({desc_spec} signals detected)"
+            )
+            debug.update(tier="C→D", title_match=m, score=score, reason=reason)
+            return score, debug
+
+        if is_product and has_retrieval:
+            score, reason = 0.50, f"Tier C: '{m}' at product co with retrieval keywords"
+        elif is_product and has_ml_ctx:
+            score, reason = 0.40, f"Tier C: '{m}' at product co with ML context"
+        elif is_product:
+            score, reason = 0.25, f"Tier C: '{m}' at product co (no ML evidence)"
+        elif has_retrieval or has_ml_ctx:
+            score, reason = 0.30, f"Tier C: '{m}' at non-product co with ML/retrieval"
+        else:
+            score, reason = 0.15, f"Tier C: '{m}' generic SWE"
+
+        debug.update(tier="C", title_match=m, score=score, reason=reason)
+        return score, debug
+
+    # ── Tier D — Frontend / Mobile / QA ──────────────────────────────────
+    if TIER_D_TITLES.search(title):
+        m = TIER_D_TITLES.search(title).group(0)
+
+        if is_product and (has_retrieval or has_ml_ctx):
+            score, reason = 0.20, (
+                f"Tier D: '{m}' at product co with ML/retrieval (unusual for this tier)"
+            )
+        elif is_product:
+            score, reason = 0.10, f"Tier D: '{m}' at product co"
+        else:
+            score, reason = 0.05, f"Tier D: '{m}' — low-relevance specialisation"
+
+        debug.update(tier="D", title_match=m, score=score, reason=reason)
+        return score, debug
+
+    # ── Fallback: unrecognised technical-sounding title ───────────────────
     if has_retrieval and is_product:
-        return 0.35
-    if has_ml_context and is_product:
-        return 0.30
+        score, reason = 0.35, "Fallback: unrecognised title with retrieval+product signal"
+    elif has_ml_ctx and is_product:
+        score, reason = 0.30, "Fallback: unrecognised title with ML+product signal"
+    else:
+        score, reason = 0.10, "Fallback: unrecognised title, no ML evidence"
 
-    return 0.15  # Any remaining technical role
+    debug.update(tier="fallback", title_match="", score=score, reason=reason)
+    return score, debug
 
 
 def _is_ml_role(title: str, description: str) -> bool:
     """Return True if this role qualifies as an applied ML/AI role."""
-    if ML_TITLES.search(title):
+    if TIER_A_TITLES.search(title):
         return True
-    # SWE at product company with retrieval/ML keywords counts
-    if SWE_TITLES.search(title) and (
+    # Tier B at product company with retrieval/ML keywords counts
+    if TIER_B_TITLES.search(title) and (
         RETRIEVAL_KEYWORDS.search(description) or ML_KEYWORDS_IN_DESC.search(description)
     ):
         return True
@@ -213,7 +409,7 @@ def compute_career_fit(candidate: dict) -> dict:
 
     Returns:
         dict with keys: score, ml_months, avg_tenure, consulting_only,
-                        has_retrieval, top_role
+                        has_retrieval, top_role, role_breakdown
     """
     profile = candidate.get("profile", {})
     career  = candidate.get("career_history", [])
@@ -225,12 +421,15 @@ def compute_career_fit(candidate: dict) -> dict:
     # ------------------------------------------------------------------
     if years_exp < 2.5 or years_exp > 18.0:
         return {
-            "score": 0.0,
-            "ml_months": 0,
-            "avg_tenure": 0.0,
+            "score":          0.0,
+            "technical_score": 0.0,
+            "career_score":   0.0,
+            "ml_months":      0,
+            "avg_tenure":     0.0,
             "consulting_only": False,
-            "has_retrieval": False,
-            "top_role": profile.get("current_title", ""),
+            "has_retrieval":  False,
+            "top_role":       profile.get("current_title", ""),
+            "role_breakdown": [],
         }
 
     # ------------------------------------------------------------------
@@ -242,9 +441,8 @@ def compute_career_fit(candidate: dict) -> dict:
     total_months    = 0
     consulting_months = 0
     has_retrieval   = False
-
-    # Check all roles including current
     all_roles_non_tech = True  # assume true, disprove below
+    role_breakdown  = []
 
     for job in career:
         title       = job.get("title", "")
@@ -253,7 +451,14 @@ def compute_career_fit(candidate: dict) -> dict:
         industry    = job.get("industry", "")
         duration    = int(job.get("duration_months", 0))
 
-        role_score = _best_role_score(title, description, company, industry)
+        role_score, debug = _score_role(title, description, company, industry)
+
+        debug["title"]    = title
+        debug["company"]  = company
+        debug["industry"] = industry
+        debug["duration_months"] = duration
+
+        role_breakdown.append(debug)
 
         # If any role has score > 0, not all non-tech
         if role_score > 0:
@@ -273,7 +478,7 @@ def compute_career_fit(candidate: dict) -> dict:
 
         total_months += duration
 
-        # Track retrieval signal
+        # Track retrieval signal (at any tier)
         if RETRIEVAL_KEYWORDS.search(description) or RETRIEVAL_KEYWORDS.search(title):
             has_retrieval = True
 
@@ -282,51 +487,47 @@ def compute_career_fit(candidate: dict) -> dict:
     # ------------------------------------------------------------------
     if all_roles_non_tech or best_score == 0.0:
         return {
-            "score": 0.0,
-            "ml_months": ml_months,
-            "avg_tenure": 0.0,
+            "score":          0.0,
+            "technical_score": 0.0,
+            "career_score":   0.0,
+            "ml_months":      ml_months,
+            "avg_tenure":     0.0,
             "consulting_only": False,
-            "has_retrieval": has_retrieval,
-            "top_role": best_role_title,
+            "has_retrieval":  has_retrieval,
+            "top_role":       best_role_title,
+            "role_breakdown": role_breakdown,
         }
 
     # ------------------------------------------------------------------
-    # Start from best role score
+    # TECHNICAL SCORE: technical relevance (Base + Depth Bonus)
     # ------------------------------------------------------------------
-    career_fit_score = best_score
+    technical_score = best_score
 
-    # ------------------------------------------------------------------
     # ML experience depth bonus
-    # JD ideal: 4-6 years in applied ML at product companies
-    # ------------------------------------------------------------------
     if 48 <= ml_months <= 72:
-        career_fit_score += 0.15
+        technical_score += 0.15
     elif 36 <= ml_months < 48:
-        career_fit_score += 0.10
+        technical_score += 0.10
     elif ml_months > 72:
-        career_fit_score += 0.08
+        technical_score += 0.08
     elif 24 <= ml_months < 36:
-        career_fit_score += 0.05
+        technical_score += 0.05
+
+    # Cap technical score at 1.0
+    technical_score = min(1.0, technical_score)
 
     # ------------------------------------------------------------------
-    # Consulting-only multiplier
-    # JD: "people who have only worked at consulting firms" are disqualified
+    # CAREER SCORE: Starts from technical_score, applies trajectory penalties
     # ------------------------------------------------------------------
+    career_score = technical_score
+
+    # Consulting-only multiplier
     consulting_fraction = (consulting_months / total_months) if total_months > 0 else 0.0
     consulting_only = consulting_fraction > 0.80
     if consulting_only:
-        career_fit_score *= 0.5
+        career_score *= 0.5
 
-    # ------------------------------------------------------------------
-    # Fix 2: Cap at 1.0 BEFORE applying job-hopping penalty
-    # base (0.90) + depth bonus (0.15) can reach 1.05 → cap first
-    # ------------------------------------------------------------------
-    career_fit_score = min(1.0, career_fit_score)
-
-    # ------------------------------------------------------------------
-    # Job-hopping penalty (v3 Fix 4 / v4 Fix 2 ordering)
-    # JD: "switching companies every 1.5 years" is explicit disqualifier
-    # ------------------------------------------------------------------
+    # Job-hopping penalty
     completed_roles = [
         j for j in career
         if not j.get("is_current", False) and int(j.get("duration_months", 0)) > 0
@@ -335,20 +536,21 @@ def compute_career_fit(candidate: dict) -> dict:
     if len(completed_roles) >= 3:
         avg_tenure = sum(int(j["duration_months"]) for j in completed_roles) / len(completed_roles)
         if avg_tenure < 12:
-            career_fit_score -= 0.20   # Severe: < 1 yr per role
+            career_score -= 0.20   # Severe: < 1 yr per role
         elif avg_tenure < 18:
-            career_fit_score -= 0.12   # JD's explicit 1.5-year threshold
+            career_score -= 0.12   # JD's explicit 1.5-year threshold
 
-    # ------------------------------------------------------------------
-    # Fix 2: Floor at 0.0 AFTER penalty
-    # ------------------------------------------------------------------
-    career_fit_score = max(0.0, career_fit_score)
+    # Floor career score at 0.0
+    career_score = max(0.0, career_score)
 
     return {
-        "score":          career_fit_score,
+        "score":          career_score,  # Keep for backward compatibility
+        "technical_score": technical_score,
+        "career_score":   career_score,
         "ml_months":      ml_months,
         "avg_tenure":     avg_tenure,
         "consulting_only": consulting_only,
         "has_retrieval":  has_retrieval,
         "top_role":       best_role_title,
+        "role_breakdown": role_breakdown,
     }
