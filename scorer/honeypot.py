@@ -41,22 +41,36 @@ def compute_honeypot_penalty(candidate: dict) -> float:
                     candidate out of the top 100 when added to the composite score
     """
     penalty = 0.0
-    signals = candidate.get("redrob_signals", {})
-    profile = candidate.get("profile", {})
-    career  = candidate.get("career_history", [])
-    skills  = candidate.get("skills", [])
-    education = candidate.get("education", [])
+    signals  = candidate.get("redrob_signals") or {}
+    profile  = candidate.get("profile") or {}
+    career   = candidate.get("career_history") or []
+    skills   = candidate.get("skills") or []
+    education = candidate.get("education") or []
 
-    total_exp_years  = float(profile.get("years_of_experience", 0))
+    def _safe_float(val, default: float = 0.0) -> float:
+        """Convert val to float, returning default for None, empty, or non-numeric."""
+        try:
+            return float(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_int(val, default: int = 0) -> int:
+        """Convert val to int, returning default for None, empty, or non-numeric."""
+        try:
+            return int(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
+
+    total_exp_years  = _safe_float(profile.get("years_of_experience"), 0.0)
     total_exp_months = total_exp_years * 12.0
 
     # ------------------------------------------------------------------
     # Check 1: Salary impossible (min > max by more than 2 LPA)
     # Example from real data: CAND with min=16.0, max=7.3
     # ------------------------------------------------------------------
-    sal = signals.get("expected_salary_range_inr_lpa", {})
-    sal_min = float(sal.get("min", 0))
-    sal_max = float(sal.get("max", 0))
+    sal = signals.get("expected_salary_range_inr_lpa") or {}
+    sal_min = _safe_float(sal.get("min"), 0.0)
+    sal_max = _safe_float(sal.get("max"), 0.0)
     if sal_min > sal_max + 2.0:
         penalty -= 0.50
 
@@ -67,7 +81,7 @@ def compute_honeypot_penalty(candidate: dict) -> float:
     # ------------------------------------------------------------------
     skill_duration_penalty = 0.0
     for skill in skills:
-        s_duration = float(skill.get("duration_months", 0))
+        s_duration = _safe_float(skill.get("duration_months"), 0.0)
         if s_duration > total_exp_months + 24:
             skill_duration_penalty -= 0.30
             if skill_duration_penalty <= -0.60:
@@ -82,7 +96,7 @@ def compute_honeypot_penalty(candidate: dict) -> float:
     zero_duration_penalty = 0.0
     for skill in skills:
         if (skill.get("proficiency") in ("expert", "advanced")
-                and int(skill.get("duration_months", 1)) == 0):
+                and _safe_int(skill.get("duration_months"), 1) == 0):
             zero_duration_penalty -= 0.20
             if zero_duration_penalty <= -0.40:
                 break
@@ -96,7 +110,7 @@ def compute_honeypot_penalty(candidate: dict) -> float:
     # ------------------------------------------------------------------
     date_mismatch_penalty = 0.0
     for job in career:
-        stated   = int(job.get("duration_months", 0))
+        stated   = _safe_int(job.get("duration_months"), 0)
         start_dt = _parse_date(job.get("start_date"))
         end_str  = job.get("end_date")
 
