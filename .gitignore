@@ -3,4 +3,8 @@ __pycache__/
 \[PUB\] India_runs_data_and_ai_challenge/
 *.pyc
 .DS_Store
-sample_submission.csv
+
+# Generated outputs & massive pre-computed data
+*.csv
+embeddings.npy
+id_index.json
