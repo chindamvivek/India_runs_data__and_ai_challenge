@@ -1,29 +1,69 @@
 """
 scorer/semantic_fit.py
 ~~~~~~~~~~~~~~~~~~~~~~
-Scores a candidate using semantic similarity between their profile text and
-the Job Description, using sentence-transformers (all-MiniLM-L6-v2).
+Scores a candidate using a weighted combination of section-level semantic
+similarities between the candidate profile and the Job Description,
+using sentence-transformers (all-MiniLM-L6-v2).
 
-Weight in composite: 12%
+Weight in composite: 12%  (unchanged — controlled in rank.py)
 
-Design (per implementation plan v4 Fix 3):
-  - Pre-computed embeddings (.npy + id_index.json) are loaded at startup
-    for the full 100K pool. Cosine similarity is a single matrix multiply (<1s).
-  - For any candidate ID NOT found in the pre-computed array (e.g., Stage 3
-    sandbox uses a different sample), the model encodes that candidate on-the-fly.
-    For ≤100 candidates this takes ~2 seconds.
-  - The model is loaded lazily — only when on-the-fly encoding is needed.
+Design (v6 — Weighted Section Semantic Scoring):
+  The candidate profile is split into three semantic sections:
 
-JD query text captures the semantic concepts the JD actually cares about,
-beyond keywords: "production ranking systems", "shipping under constraints", etc.
+    Section 1 — Career History
+        Concatenated ``description`` fields from career_history only.
+        Excludes: job titles, company names, dates, duration.
 
-Returns:
-    float [0.0, 1.0] — cosine similarity to the JD embedding
+    Section 2 — Summary
+        The profile ``summary`` field only.
+
+    Section 3 — Skills
+        Concatenated skill ``name`` values only.
+        Excludes: proficiency, endorsements, duration_months.
+
+  Three independent embeddings are generated per candidate, producing three
+  cosine similarities against the same JD embedding:
+
+        career_similarity  — how AI/ML-aligned the actual job descriptions are
+        summary_similarity — how AI/ML-aligned the candidate's own pitch is
+        skills_similarity  — how AI/ML-aligned the skill names list are
+
+  Final semantic score (the value returned to rank.py):
+
+        semantic_fit = CAREER_WEIGHT  * career_similarity
+                     + SUMMARY_WEIGHT * summary_similarity
+                     + SKILLS_WEIGHT  * skills_similarity
+
+  Section weights (tunable — defined as named constants below):
+        CAREER_WEIGHT  = 0.60
+        SUMMARY_WEIGHT = 0.20
+        SKILLS_WEIGHT  = 0.20
+
+  All three section similarities AND the final weighted score are stored in
+  _section_scores_cache per candidate, retrievable via get_section_scores().
+
+  NOTE: The old single-embedding concatenated approach (v4) has been removed.
+  The pre-computed embeddings (.npy + id_index.json) are no longer used.
+  All encoding is done on-the-fly in a single batched model.encode() pass.
+
+Public API
+----------
+compute_all_semantic_scores(candidates, ...)
+    → dict[str, float]   — weighted semantic score per candidate; used by rank.py
+
+compute_all_section_scores(candidates)
+    → dict[str, dict[str, float]]
+      Keys per candidate: career_similarity, summary_similarity, skills_similarity
+
+get_section_scores(candidate_id)
+    → dict[str, float] | None
+      Keys: career_similarity, summary_similarity, skills_similarity, final_semantic
+
+initialise(...)
+    Pre-warms the model and JD embedding at startup (call once from rank.py).
 """
 
 from __future__ import annotations
-import json
-import os
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -44,41 +84,41 @@ JD_QUERY = (
 )
 
 # ---------------------------------------------------------------------------
-# File paths for pre-computed embeddings
+# Section weights — tune these to adjust the contribution of each section
+# to the final semantic score. Must sum to 1.0.
 # ---------------------------------------------------------------------------
-_DEFAULT_EMBEDDINGS_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "embeddings.npy"
-)
-_DEFAULT_INDEX_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "id_index.json"
+CAREER_WEIGHT:  float = 0.60
+SUMMARY_WEIGHT: float = 0.20
+SKILLS_WEIGHT:  float = 0.20
+assert abs(CAREER_WEIGHT + SUMMARY_WEIGHT + SKILLS_WEIGHT - 1.0) < 1e-9, (
+    "Section weights must sum to 1.0"
 )
 
 # ---------------------------------------------------------------------------
 # Module-level cache — loaded once per process
 # ---------------------------------------------------------------------------
-_embeddings_matrix: np.ndarray | None = None   # shape (N, 384)
-_id_to_row: dict[str, int] | None = None        # candidate_id → row index
-_jd_embedding: np.ndarray | None = None         # shape (384,)
-_model = None                                    # sentence-transformers model (lazy)
+_jd_embedding: np.ndarray | None = None  # shape (384,)
+_model = None                             # sentence-transformers model (lazy)
+
+# ---------------------------------------------------------------------------
+# Section scores inspection cache
+# Populated by compute_all_section_scores() (and therefore by
+# compute_all_semantic_scores() which calls it internally).
+#
+# Key:   candidate_id (str)
+# Value: {
+#     "career_similarity":  float,
+#     "summary_similarity": float,
+#     "skills_similarity":  float,
+#     "final_semantic":     float,   ← weighted combination
+# }
+# ---------------------------------------------------------------------------
+_section_scores_cache: dict[str, dict[str, float]] = {}
 
 
-def _load_precomputed(
-    embeddings_path: str = _DEFAULT_EMBEDDINGS_PATH,
-    index_path: str = _DEFAULT_INDEX_PATH,
-) -> bool:
-    """Load pre-computed embeddings and id index. Returns True if successful."""
-    global _embeddings_matrix, _id_to_row
-    if _embeddings_matrix is not None:
-        return True   # Already loaded
-
-    if not os.path.exists(embeddings_path) or not os.path.exists(index_path):
-        return False  # Pre-computed files not available
-
-    _embeddings_matrix = np.load(embeddings_path).astype(np.float32)
-    with open(index_path, "r", encoding="utf-8") as f:
-        _id_to_row = json.load(f)
-    return True
-
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _get_model():
     """Lazily load the sentence-transformers model (only when needed)."""
@@ -100,85 +140,197 @@ def _get_jd_embedding() -> np.ndarray:
     return _jd_embedding
 
 
-def _build_candidate_text(candidate: dict) -> str:
-    """Assemble a single text string representing the candidate's profile."""
-    profile  = candidate.get("profile", {})
-    career   = candidate.get("career_history", [])
-    skills   = candidate.get("skills", [])
+def _clamp(v: float) -> float:
+    """Clamp a cosine similarity to [0.0, 1.0]."""
+    return max(0.0, min(1.0, float(v)))
 
-    headline = profile.get("headline", "")
-    summary  = profile.get("summary", "")
 
-    # Use the 3 most recent job descriptions (most recent = most relevant)
-    job_descs = " ".join(
-        j.get("description", "") for j in career[:3]
-    )
+# ---------------------------------------------------------------------------
+# Section text builders — each extracts one clean string per section
+# ---------------------------------------------------------------------------
 
-    # Include top skill names to help semantic matching
-    skill_names = " ".join(s.get("name", "") for s in skills[:15])
+def _build_career_text(candidate: dict) -> str:
+    """
+    Section 1 — Career History.
 
-    return f"{headline} {summary} {job_descs} {skill_names}".strip()
+    Concatenates only the ``description`` field of each career_history entry.
+    Excludes: job titles, company names, start/end dates, duration_months.
 
+    Uses all available roles (not capped at 3) so the model sees the full
+    career picture, not just the three most recent roles.
+    """
+    career = candidate.get("career_history") or []
+    descs = [(j.get("description") or "") for j in career if (j.get("description") or "").strip()]
+    return " ".join(descs).strip()
+
+
+def _build_summary_text(candidate: dict) -> str:
+    """
+    Section 2 — Summary.
+
+    Returns the profile ``summary`` field only.
+    """
+    profile = candidate.get("profile") or {}
+    return (profile.get("summary") or "").strip()
+
+
+def _build_skills_text(candidate: dict) -> str:
+    """
+    Section 3 — Skills.
+
+    Concatenates only the ``name`` field from each skills entry.
+    Excludes: proficiency, endorsements, duration_months.
+    """
+    skills = candidate.get("skills") or []
+    names = [(s.get("name") or "") for s in skills if (s.get("name") or "").strip()]
+    return " ".join(names).strip()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def initialise(
-    embeddings_path: str = _DEFAULT_EMBEDDINGS_PATH,
-    index_path: str = _DEFAULT_INDEX_PATH,
+    embeddings_path: str = "",   # kept for call-site backward compat with rank.py
+    index_path: str = "",        # kept for call-site backward compat with rank.py
 ) -> None:
     """
     Pre-load everything at startup so the first score() call is fast.
     Call this once from rank.py before the scoring loop.
+
+    Note: ``embeddings_path`` and ``index_path`` are accepted but ignored.
+    Pre-computed embeddings (.npy) from the old pipeline are no longer used;
+    all encoding is done on-the-fly using the section-based pipeline.
     """
-    _load_precomputed(embeddings_path, index_path)
-    # Always pre-compute the JD embedding (needs the model regardless)
-    _get_jd_embedding()
+    _get_jd_embedding()   # pre-warm model + compute JD embedding once
+
+
+def get_section_scores(candidate_id: str) -> dict[str, float] | None:
+    """
+    Return the section-level similarities and final weighted score for one
+    candidate.
+
+    The cache is populated by compute_all_section_scores() or by
+    compute_all_semantic_scores() (which calls it internally).
+
+    Returns:
+        dict with keys:
+            career_similarity  float — career descriptions vs JD
+            summary_similarity float — profile summary vs JD
+            skills_similarity  float — skill names vs JD
+            final_semantic     float — weighted combination (used in ranking)
+        or None if this candidate_id has not been scored yet.
+    """
+    return _section_scores_cache.get(candidate_id)
+
+
+def compute_all_section_scores(
+    candidates: list[dict],
+) -> dict[str, dict[str, float]]:
+    """
+    Compute three independent section-level cosine similarities for every
+    candidate, plus the final weighted semantic score.
+
+    Strategy:
+      - Extract three text strings per candidate (career / summary / skills).
+      - Encode all 3 × N strings in a single batched model.encode() call.
+      - Compute dot products against the shared, pre-cached JD embedding.
+      - Compute weighted combination per candidate.
+      - Store all four values in _section_scores_cache.
+
+    Returns:
+        dict mapping candidate_id → {
+            "career_similarity":  float,
+            "summary_similarity": float,
+            "skills_similarity":  float,
+            "final_semantic":     float,
+        }
+        All values are in [0.0, 1.0].
+    """
+    jd_emb = _get_jd_embedding()
+    model  = _get_model()
+
+    # Build three parallel text lists (same order as candidates)
+    career_texts  = [_build_career_text(c)  for c in candidates]
+    summary_texts = [_build_summary_text(c) for c in candidates]
+    skills_texts  = [_build_skills_text(c)  for c in candidates]
+
+    # Single batched encode — 3 × N strings, one model forward pass
+    all_texts = career_texts + summary_texts + skills_texts
+    all_embs  = model.encode(
+        all_texts,
+        batch_size=64,
+        normalize_embeddings=True,
+        show_progress_bar=len(candidates) > 200,
+    ).astype(np.float32)
+
+    n = len(candidates)
+    career_embs  = all_embs[:n]         # rows 0 … n-1
+    summary_embs = all_embs[n : 2 * n]  # rows n … 2n-1
+    skills_embs  = all_embs[2 * n :]    # rows 2n … 3n-1
+
+    # Cosine similarity = dot product (L2-normalised embeddings)
+    career_sims  = career_embs  @ jd_emb  # shape (N,)
+    summary_sims = summary_embs @ jd_emb  # shape (N,)
+    skills_sims  = skills_embs  @ jd_emb  # shape (N,)
+
+    result: dict[str, dict[str, float]] = {}
+    for i, cand in enumerate(candidates):
+        cid      = cand["candidate_id"]
+        c_sim    = _clamp(career_sims[i])
+        s_sim    = _clamp(summary_sims[i])
+        sk_sim   = _clamp(skills_sims[i])
+        weighted = _clamp(
+            CAREER_WEIGHT  * c_sim
+            + SUMMARY_WEIGHT * s_sim
+            + SKILLS_WEIGHT  * sk_sim
+        )
+        entry = {
+            "career_similarity":  c_sim,
+            "summary_similarity": s_sim,
+            "skills_similarity":  sk_sim,
+            "final_semantic":     weighted,
+        }
+        result[cid]                 = entry
+        _section_scores_cache[cid] = entry   # populate inspection cache
+
+    return result
 
 
 def compute_all_semantic_scores(
     candidates: list[dict],
-    embeddings_path: str = _DEFAULT_EMBEDDINGS_PATH,
-    index_path: str = _DEFAULT_INDEX_PATH,
+    embeddings_path: str = "",   # kept for call-site backward compat with rank.py
+    index_path: str = "",        # kept for call-site backward compat with rank.py
 ) -> dict[str, float]:
     """
-    Compute semantic scores for all candidates efficiently.
+    Compute the final semantic score for all candidates.
 
-    Strategy:
-      1. For candidates found in the pre-computed array → matrix multiply
-      2. For candidates NOT in the array → encode on-the-fly in one batch
+    This is the primary entry point called by rank.py.
+    Returns dict[str, float] — one weighted semantic score per candidate.
+
+    Internally calls compute_all_section_scores() which:
+      - Generates one batched embedding for all three sections
+      - Computes career_similarity, summary_similarity, skills_similarity
+      - Computes the weighted combination as the final semantic score
+      - Stores all four values in _section_scores_cache for debugging
+
+    Formula:
+        semantic_fit = CAREER_WEIGHT  * career_similarity
+                     + SUMMARY_WEIGHT * summary_similarity
+                     + SKILLS_WEIGHT  * skills_similarity
+
+        Where:  CAREER_WEIGHT={cw}  SUMMARY_WEIGHT={sw}  SKILLS_WEIGHT={skw}
+
+    Note: ``embeddings_path`` and ``index_path`` are accepted for backward
+    compatibility with rank.py's call signature but are not used.
 
     Returns:
-        dict mapping candidate_id → semantic_score (float in [0.0, 1.0])
-    """
-    _load_precomputed(embeddings_path, index_path)
-    jd_emb = _get_jd_embedding()
+        dict mapping candidate_id -> semantic_score (float in [0.0, 1.0])
+    """.format(cw=CAREER_WEIGHT, sw=SUMMARY_WEIGHT, skw=SKILLS_WEIGHT)
 
-    scores: dict[str, float] = {}
-    missing_ids: list[str] = []
-    missing_texts: list[str] = []
+    section_results = compute_all_section_scores(candidates)
 
-    for cand in candidates:
-        cid = cand["candidate_id"]
-        if _id_to_row is not None and cid in _id_to_row:
-            # Use pre-computed embedding
-            row = _id_to_row[cid]
-            emb = _embeddings_matrix[row]  # already L2-normalised
-            score = float(np.dot(emb, jd_emb))
-            scores[cid] = max(0.0, min(1.0, score))
-        else:
-            # Will encode on-the-fly in a batch below
-            missing_ids.append(cid)
-            missing_texts.append(_build_candidate_text(cand))
-
-    if missing_ids:
-        model = _get_model()
-        batch_embs = model.encode(
-            missing_texts,
-            batch_size=64,
-            normalize_embeddings=True,
-            show_progress_bar=len(missing_ids) > 200,
-        ).astype(np.float32)
-
-        batch_scores = batch_embs @ jd_emb  # shape (N,)
-        for cid, score in zip(missing_ids, batch_scores.tolist()):
-            scores[cid] = max(0.0, min(1.0, float(score)))
-
-    return scores
+    return {
+        cid: scores["final_semantic"]
+        for cid, scores in section_results.items()
+    }
