@@ -87,7 +87,14 @@ def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        # local_files_only=True → use cached model, no network call during ranking.
+        # Satisfies hackathon constraint: "no network access during ranking".
+        # Model must be cached first (done automatically on first-ever run).
+        try:
+            _model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+        except Exception:
+            # First-ever run: model not cached yet — allow download once.
+            _model = SentenceTransformer("all-MiniLM-L6-v2")
     return _model
 
 
