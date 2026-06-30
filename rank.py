@@ -170,6 +170,7 @@ def score_all(
             "ml_months":        cf["ml_months"],
             "avg_tenure":       cf["avg_tenure"],
             "consulting_only":  cf["consulting_only"],
+            "academic_only":    cf.get("academic_only", False),
             "has_retrieval":    cf["has_retrieval"],
             "top_role":         cf["top_role"],
             # From skills_fit
