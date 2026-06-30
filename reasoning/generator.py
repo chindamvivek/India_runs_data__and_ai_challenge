@@ -63,6 +63,7 @@ def build_reasoning(candidate: dict, scored_data: dict, rank: int) -> str:
     ml_months        = int(scored_data.get("ml_months", 0))
     avg_tenure       = float(scored_data.get("avg_tenure", 0.0))
     consulting_only  = bool(scored_data.get("consulting_only", False))
+    academic_only    = bool(scored_data.get("academic_only", False))
     has_retrieval    = bool(scored_data.get("has_retrieval", False))
     top_skills       = list(scored_data.get("top_skills", []))
     days_inactive    = int(scored_data.get("days_inactive", 0))
@@ -108,17 +109,31 @@ def build_reasoning(candidate: dict, scored_data: dict, rank: int) -> str:
 
     # ────────────────────────────────────────────────────────────────────────
     # STRENGTH — pulled from scored_data facts, not invented
+    # Appending top_skills (when available) ensures no two candidates share
+    # an identical reasoning string even if they have the same ml_months bucket
+    # and has_retrieval flag. (Stage 4 penalises non-unique reasoning.)
     # ────────────────────────────────────────────────────────────────────────
     if ml_months >= 48 and has_retrieval:
-        strength = (
+        base = (
             f"brings {_format_yrs(ml_months)} yrs building production retrieval "
             f"and ranking systems at product companies"
         )
+        # Append top skills for uniqueness when they exist
+        if top_skills:
+            skill_str = " and ".join(top_skills[:2])
+            strength = f"{base}; key verified skills: {skill_str}"
+        else:
+            strength = base
     elif ml_months >= 48:
-        strength = (
+        base = (
             f"brings {_format_yrs(ml_months)} yrs of applied ML/AI engineering "
             f"at product companies"
         )
+        if top_skills:
+            skill_str = " and ".join(top_skills[:2])
+            strength = f"{base}; strongest skills: {skill_str}"
+        else:
+            strength = base
     elif has_retrieval and top_skills:
         strength = (
             f"career history shows hands-on retrieval/ranking work; "
@@ -143,7 +158,12 @@ def build_reasoning(candidate: dict, scored_data: dict, rank: int) -> str:
     # ────────────────────────────────────────────────────────────────────────
     concern: str | None = None
 
-    if notice_days > 120:
+    if academic_only:
+        concern = (
+            "career is entirely in academic/research institutions with no evidence "
+            "of production deployment — explicit JD disqualifier; ranked on skills signals only"
+        )
+    elif notice_days > 120:
         concern = (
             f"notice period is {notice_days} days — unusually long for a "
             f"fast-moving startup; early engagement recommended"
