@@ -184,8 +184,17 @@ def _match_weight(skill_name: str) -> float | None:
 
 def _langchain_penalty(skill_names_lower: set[str]) -> float:
     """
-    Return -0.10 penalty only if LangChain is present AND no production
-    retrieval skills are in the skill list (v3 Fix 1 / contextual penalty).
+    Penalize LangChain-only tutorial profiles.
+
+    JD: "Framework enthusiasts whose GitHub is full of LangChain tutorials
+    and blog posts about 'How I used [hot framework] to build [demo]' —
+    that's fine but it's not what we need."
+
+    Penalty tiers:
+      - LangChain present + no production retrieval skills: -0.20
+        (near-disqualifier per JD; doubled from v3's -0.10)
+      - LangChain present + production retrieval skills:      0.00
+        (legitimate: using LangChain as orchestration over real infra)
     """
     has_langchain = any("langchain" in s for s in skill_names_lower)
     if not has_langchain:
@@ -193,9 +202,9 @@ def _langchain_penalty(skill_names_lower: set[str]) -> float:
 
     has_production_retrieval = bool(skill_names_lower & PRODUCTION_RETRIEVAL_SKILLS)
     if has_production_retrieval:
-        return 0.0   # LangChain + real retrieval skills → no penalty
+        return 0.0   # LangChain + real retrieval skills -> no penalty
 
-    return -0.10     # Framework enthusiast with no production retrieval experience
+    return -0.20     # Framework enthusiast with no production retrieval experience
 
 
 def compute_skills_fit(candidate: dict) -> dict:
