@@ -188,6 +188,41 @@ CONSULTING_FIRMS = {
     "l&t infotech", "mindtree",
 }
 
+# Freelancer / self-employed patterns — never count as a product company
+FREELANCE_PATTERNS = re.compile(
+    r"\b("
+    r"freelance|freelancer|self.employed|self employed|"
+    r"independent contractor|contract|consultant|sole proprietor|"
+    r"upwork|toptal|fiverr"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Academic / research institution detection
+# A candidate whose career is exclusively at academic orgs has no production
+# deployment experience — a hard disqualifier per the JD.
+ACADEMIC_INSTITUTIONS = re.compile(
+    r"\b("
+    r"university|college|institute of technology|iit|iim|iisc|"
+    r"nit |nit\b|bits pilani|iiser|"
+    r"stanford|mit|carnegie mellon|cmu|harvard|oxford|cambridge|"
+    r"cornell|caltech|princeton|yale|ucb|ucla|cmu|"
+    r"research lab|research laboratory|research institute|"
+    r"national lab|national laboratory|"
+    r"deepmind|openai research|google brain|microsoft research|"
+    r"fair|meta ai research|ai lab|ai research"
+    r")\b",
+    re.IGNORECASE,
+)
+
+ACADEMIC_INDUSTRY_LABELS = re.compile(
+    r"\b("
+    r"academic|academia|higher education|research|education|"
+    r"government research|non.profit research"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Word-boundary regex against curated tech/startup industry terms.
 # Deliberately excludes the generic word "product" to avoid matching
 # "Paper Products", "Consumer Products", "Food Products", etc.
@@ -218,14 +253,34 @@ def _is_consulting_company(company: str, industry: str) -> bool:
     return False
 
 
+def _is_freelance(company: str) -> bool:
+    """Return True if the company is a freelance/self-employed arrangement."""
+    return bool(FREELANCE_PATTERNS.search(company))
+
+
+def _is_academic_company(company: str, industry: str) -> bool:
+    """
+    Return True if the company is an academic institution or research lab.
+    Academic experience ≠ production experience (explicit JD disqualifier).
+    """
+    return bool(
+        ACADEMIC_INSTITUTIONS.search(company)
+        or ACADEMIC_INDUSTRY_LABELS.search(industry)
+    )
+
+
 def _is_product_company(company: str, industry: str) -> bool:
     """
     Return True if the company is a technology product company.
 
     Uses word-boundary matching against TECH_PRODUCT_INDUSTRIES.
-    Consulting firms are always False regardless of industry label.
+    Consulting firms, freelancers, and academic institutions are always False.
     """
     if _is_consulting_company(company, industry):
+        return False
+    if _is_freelance(company):
+        return False
+    if _is_academic_company(company, industry):
         return False
     return bool(TECH_PRODUCT_INDUSTRIES.search(industry))
 
@@ -260,11 +315,12 @@ def _score_role(
     Score a single career role. Returns (base_score, debug_dict).
 
     The debug_dict contains:
-        tier        str   — A / B / C / D / non-tech / fallback
+        tier        str   — A / B / C / D / non-tech / academic / fallback
         title_match str   — which regex matched the title
         desc_spec   str   — description specialisation override (or None)
         is_product  bool
         is_consulting bool
+        is_academic bool
         has_retrieval bool
         has_ml_context bool
         score       float
@@ -272,6 +328,8 @@ def _score_role(
     """
     is_product    = _is_product_company(company, industry)
     is_consulting = _is_consulting_company(company, industry)
+    is_academic   = _is_academic_company(company, industry)
+    is_freelance  = _is_freelance(company)
     has_retrieval = bool(RETRIEVAL_KEYWORDS.search(description))
     has_ml_ctx    = bool(ML_KEYWORDS_IN_DESC.search(description))
     desc_spec     = _detect_desc_specialisation(description)
@@ -279,6 +337,7 @@ def _score_role(
     debug = {
         "is_product":    is_product,
         "is_consulting": is_consulting,
+        "is_academic":   is_academic,
         "has_retrieval": has_retrieval,
         "has_ml_context": has_ml_ctx,
         "desc_spec":     desc_spec,   # "qa", "frontend", "mobile", or None
@@ -290,6 +349,30 @@ def _score_role(
         debug.update(tier="non-tech", title_match=m,
                      score=0.0, reason=f"Non-technical title: '{m}'")
         return 0.0, debug
+
+    # ── Academic institution override ────────────────────────────────────
+    # JD: "pure research environments (academic labs, research-only roles)
+    # without any production deployment — we will not move forward."
+    # Tier A titles at academic companies are capped at 0.35 (Tier B level).
+    # This prevents a career of only academic papers from scoring like
+    # a production ML engineer.
+    if is_academic:
+        if TIER_A_TITLES.search(title) or TIER_B_TITLES.search(title):
+            m = (TIER_A_TITLES.search(title) or TIER_B_TITLES.search(title)).group(0)
+            # Allow a small boost if description shows retrieval work (rare but fair)
+            score = 0.30 if has_retrieval else 0.20
+            reason = (
+                f"Academic institution cap: '{m}' at academic org — "
+                f"no production deployment credit (JD disqualifier). "
+                + ("Retrieval keywords in desc (+0.10)." if has_retrieval else "")
+            )
+            debug.update(tier="academic", title_match=m, score=score, reason=reason)
+            return score, debug
+        elif TIER_C_TITLES.search(title) or TIER_D_TITLES.search(title):
+            score = 0.10
+            reason = f"Academic institution: lower-tier title, no production credit"
+            debug.update(tier="academic", title_match="", score=score, reason=reason)
+            return score, debug
 
     # ── Tier A — Direct ML / AI / Search title ───────────────────────────
     if TIER_A_TITLES.search(title):
@@ -387,8 +470,14 @@ def _score_role(
     return score, debug
 
 
-def _is_ml_role(title: str, description: str) -> bool:
-    """Return True if this role qualifies as an applied ML/AI role."""
+def _is_ml_role(title: str, description: str, company: str = "", industry: str = "") -> bool:
+    """
+    Return True if this role qualifies as an APPLIED (production) ML/AI role.
+    Academic-only research roles do NOT count — they lack production deployment.
+    """
+    # Academic companies: never count as applied ML (no production deployment)
+    if _is_academic_company(company, industry):
+        return False
     if TIER_A_TITLES.search(title):
         return True
     # Tier B at product company with retrieval/ML keywords counts
@@ -444,6 +533,8 @@ def compute_career_fit(candidate: dict) -> dict:
     all_roles_non_tech = True  # assume true, disprove below
     role_breakdown  = []
 
+    academic_months = 0  # Track months at academic institutions
+
     for job in career:
         title       = job.get("title", "")
         description = job.get("description", "")
@@ -468,13 +559,17 @@ def compute_career_fit(candidate: dict) -> dict:
             best_score = role_score
             best_role_title = title
 
-        # Track ML months
-        if _is_ml_role(title, description):
+        # Track ML months — only production (non-academic) roles count
+        if _is_ml_role(title, description, company, industry):
             ml_months += duration
 
         # Track consulting months
         if _is_consulting_company(company, industry):
             consulting_months += duration
+
+        # Track academic months
+        if _is_academic_company(company, industry):
+            academic_months += duration
 
         total_months += duration
 
@@ -527,6 +622,16 @@ def compute_career_fit(candidate: dict) -> dict:
     if consulting_only:
         career_score *= 0.5
 
+    # Academic-only multiplier — same severity as consulting-only.
+    # JD: "pure research environments without any production deployment
+    # — we will not move forward."
+    # Applying 0.40× penalty: steeper than consulting (0.50×) because
+    # academic experience is a harder disqualifier per the JD.
+    academic_fraction = (academic_months / total_months) if total_months > 0 else 0.0
+    academic_only = academic_fraction > 0.80
+    if academic_only:
+        career_score *= 0.40
+
     # Job-hopping penalty
     completed_roles = [
         j for j in career
@@ -550,6 +655,7 @@ def compute_career_fit(candidate: dict) -> dict:
         "ml_months":      ml_months,
         "avg_tenure":     avg_tenure,
         "consulting_only": consulting_only,
+        "academic_only":  academic_only,
         "has_retrieval":  has_retrieval,
         "top_role":       best_role_title,
         "role_breakdown": role_breakdown,
