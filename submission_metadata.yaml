@@ -1,0 +1,106 @@
+# Redrob Hackathon — Submission Metadata
+# ============================================================
+# FILL IN: team_name, primary_contact, team_members, github_repo, sandbox_link
+# Everything else is pre-filled based on our actual implementation.
+# ============================================================
+
+# ============================================================
+# Team identity
+# ============================================================
+team_name: "chindamvivek"
+
+primary_contact:
+  name: "Vivek Chindam"           # <-- PLEASE VERIFY/EDIT
+  email: "22.6c5vivek@gmail.com"
+  phone: "+91-9908928675"         # <-- FILL IN YOUR ACTUAL PHONE
+
+team_members: []                  # Solo participation
+
+# ============================================================
+# Code and reproducibility
+# ============================================================
+github_repo: "https://github.com/chindamvivek/India_runs_data__and_ai_challenge"
+
+sandbox_link: "https://vivek-india-runs-hackathon-data-and-ai-challenge.streamlit.app"
+# Deploy app.py to Streamlit Cloud (https://share.streamlit.io) or
+# HuggingFace Spaces and paste the URL above.
+# See Phase 8 README for deploy steps.
+
+reproduce_command: "python rank.py --candidates ./candidates.jsonl --team-id YOUR_TEAM_ID"
+# NOTE: Run `python precompute.py` first (one-time, ~10 min) to generate
+# embeddings.npy. After that, rank.py completes in under 5 minutes.
+
+# ============================================================
+# Compute environment
+# ============================================================
+compute:
+  platform: "Windows 11, Local Machine"
+  cpu_cores: 8
+  ram_gb: 16
+  python_version: "3.10"
+  os: "Windows 11"
+  uses_gpu_for_inference: false        # CPU-only, no GPU required
+  has_network_during_ranking: false    # Fully offline after precompute step
+  pre_computation_required: true       # precompute.py must be run once
+  pre_computation_time_minutes: 12     # ~10-15 min for 100K candidates on CPU
+
+# ============================================================
+# AI tools declaration
+# ============================================================
+ai_tools_used:
+  - "Antigravity (AI coding assistant by Google DeepMind)"
+  - "Claude Sonnet"
+
+ai_usage_summary: |
+  Used an AI coding assistant (Antigravity by Google DeepMind) for pair
+  programming: architecture design, module scaffolding, code review, and
+  debugging. All scoring logic (career fit tiers, skills trust weights,
+  honeypot checks, behavioral signal weights) was designed by the team and
+  reviewed line-by-line before acceptance. No candidate data was fed to any
+  external LLM API during the ranking pipeline itself — the pipeline is
+  fully offline after the one-time precompute step.
+
+# ============================================================
+# Approach summary
+# ============================================================
+methodology_summary: |
+  Multi-dimensional candidate ranking system with 5 weighted sub-scores:
+
+  1. Career Fit (35%): Full career history analysis using tiered title
+     matching (ML Engineer > SWE at product co > generic SWE), ML experience
+     depth bonus for 36-72 months, 0.5x consulting-only multiplier, and
+     job-hopping penalty for avg tenure < 18 months.
+
+  2. Skills Fit (25%): Trust-weighted scoring where each skill score =
+     base_weight x proficiency_factor x duration_factor x endorsement_factor.
+     Fixed-cap normalisation (not min-max) for stability across candidate
+     subsets. Contextual LangChain penalty only when no production retrieval
+     skills (FAISS/Pinecone/Qdrant) are present.
+
+  3. Behavioral (20%): 6 platform signals — recency, recruiter response
+     rate, notice period, open-to-work flag, profile completeness, interview
+     completion rate. Weights sum to exactly 1.0.
+
+  4. Semantic (12%): sentence-transformers all-MiniLM-L6-v2 encoding of
+     candidate profile text vs. JD query. Pre-computed as a matrix; ranking
+     is a single dot-product operation taking <1 second.
+
+  5. Location (8%): Tiered scoring for Pune/Noida/Delhi NCR > Tier-1 India
+     cities > rest of India > international.
+
+  Honeypot detection: 5 integrity checks (salary inversion, skill duration
+  > career length, expert proficiency at 0 months, career date math mismatch,
+  impossible education timeline) apply a negative penalty that pushes flagged
+  candidates well below all legitimate candidates.
+
+  Runtime: ~10s for 50 candidates with pre-computed embeddings.
+
+# ============================================================
+# Declarations
+# ============================================================
+declarations:
+  read_submission_spec: true
+  code_is_original_work: true
+  no_collusion: true
+  honeypot_check_done: true       # 5 integrity checks implemented in scorer/honeypot.py
+  reproduction_tested: true       # rank.py tested end-to-end on sample_candidates.json
